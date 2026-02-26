@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Diagnostics;
 
 internal static class Program
 {
@@ -13,6 +14,8 @@ internal static class Program
             return;
         }
 
+        OpenChromeWindow();
+
         if (!GetCursorPos(out var start))
         {
             Console.WriteLine("Could not read cursor position.");
@@ -24,6 +27,27 @@ internal static class Program
         Console.WriteLine(
             $"Movement disabled. Would move to X={start.X + MovePixels}, Y={start.Y}, " +
             $"wait {PauseMilliseconds}ms, then return to X={start.X}, Y={start.Y}.");
+    }
+
+    private static void OpenChromeWindow()
+    {
+        try
+        {
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = "cmd.exe",
+                Arguments = "/c start \"\" chrome --new-window about:blank",
+                UseShellExecute = true,
+                CreateNoWindow = true
+            };
+
+            Process.Start(startInfo);
+            Console.WriteLine("Opened a new Chrome window.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Could not open Chrome window: {ex.Message}");
+        }
     }
 
     [DllImport("user32.dll", SetLastError = true)]
