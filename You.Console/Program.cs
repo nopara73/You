@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using System.Diagnostics;
+using You.Library;
 
 internal static class Program
 {
@@ -29,7 +30,6 @@ internal static class Program
     private const byte VirtualKeyEnter = 0x0D;
     private const byte VirtualKeyEscape = 0x1B;
     private const byte VirtualKeyL = 0x4C;
-    private const byte VirtualKeyPeriod = 0xBE;
     private const uint ClipboardUnicodeText = 13;
 
     private static void Main()
@@ -143,7 +143,7 @@ internal static class Program
         Thread.Sleep(Random.Shared.Next(100, 200));
 
         var copiedText = ReadClipboardTextWithRetries();
-        if (UrlTextMatchesTarget(copiedText))
+        if (BrowserInputLogic.UrlTextMatchesTarget(copiedText, TargetUrl))
         {
             return;
         }
@@ -155,19 +155,6 @@ internal static class Program
         TypeTextHumanLike(TargetUrl);
         Thread.Sleep(Random.Shared.Next(70, 160));
         PressKeyHumanLike(VirtualKeyEscape);
-    }
-
-    private static bool UrlTextMatchesTarget(string? text)
-    {
-        if (string.IsNullOrWhiteSpace(text))
-        {
-            return false;
-        }
-
-        var normalized = text.Trim().ToLowerInvariant();
-        normalized = normalized.Replace("https://", string.Empty).Replace("http://", string.Empty);
-        normalized = normalized.TrimEnd('/');
-        return normalized == TargetUrl;
     }
 
     private static string? ReadClipboardTextWithRetries()
@@ -226,7 +213,7 @@ internal static class Program
     {
         foreach (var character in text)
         {
-            if (!TryGetVirtualKeyForCharacter(character, out var virtualKey))
+            if (!BrowserInputLogic.TryGetVirtualKeyForCharacter(character, out var virtualKey))
             {
                 continue;
             }
@@ -234,30 +221,6 @@ internal static class Program
             PressKeyHumanLike(virtualKey);
             Thread.Sleep(Random.Shared.Next(MinInterKeyDelayMilliseconds, MaxInterKeyDelayMilliseconds + 1));
         }
-    }
-
-    private static bool TryGetVirtualKeyForCharacter(char character, out byte virtualKey)
-    {
-        if (character is >= 'a' and <= 'z')
-        {
-            virtualKey = (byte)char.ToUpperInvariant(character);
-            return true;
-        }
-
-        if (character is >= 'A' and <= 'Z')
-        {
-            virtualKey = (byte)character;
-            return true;
-        }
-
-        if (character == '.')
-        {
-            virtualKey = VirtualKeyPeriod;
-            return true;
-        }
-
-        virtualKey = 0;
-        return false;
     }
 
     private static bool MoveCursorSmoothly(int fromX, int fromY, int toX, int toY)
@@ -278,7 +241,7 @@ internal static class Program
         for (var step = 1; step <= CursorMoveSteps; step++)
         {
             var t = (double)step / CursorMoveSteps;
-            var easedT = EaseInOutCubic(t);
+            var easedT = BrowserInputLogic.EaseInOutCubic(t);
 
             var baseX = fromX + (deltaX * easedT);
             var baseY = fromY + (deltaY * easedT);
@@ -305,13 +268,6 @@ internal static class Program
         }
 
         return SetCursorPos(toX, toY);
-    }
-
-    private static double EaseInOutCubic(double t)
-    {
-        return t < 0.5
-            ? 4.0 * t * t * t
-            : 1.0 - Math.Pow(-2.0 * t + 2.0, 3.0) / 2.0;
     }
 
     [DllImport("user32.dll", SetLastError = true)]
