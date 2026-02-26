@@ -6,6 +6,13 @@ internal static class Program
     private const int ChromeLaunchDelayMilliseconds = 2500;
     private const int MouseClickDelayMilliseconds = 900;
     private const int PostClickKeyboardDelayMilliseconds = 120;
+    private const int MinKeyDownMilliseconds = 35;
+    private const int MaxKeyDownMilliseconds = 90;
+    private const int MinInterKeyDelayMilliseconds = 60;
+    private const int MaxInterKeyDelayMilliseconds = 190;
+    private const string TargetUrl = "twitter.com";
+    private const int ClipboardReadRetries = 4;
+    private const int ClipboardReadRetryDelayMilliseconds = 80;
     private const int CursorMoveSteps = 150;
     private const int MinCursorMoveStepDelayMilliseconds = 10;
     private const int MaxCursorMoveStepDelayMilliseconds = 28;
@@ -17,6 +24,13 @@ internal static class Program
     private const uint KeyEventKeyUp = 0x0002;
     private const byte VirtualKeyControl = 0x11;
     private const byte VirtualKeyA = 0x41;
+    private const byte VirtualKeyC = 0x43;
+    private const byte VirtualKeyDelete = 0x2E;
+    private const byte VirtualKeyEnter = 0x0D;
+    private const byte VirtualKeyEscape = 0x1B;
+    private const byte VirtualKeyL = 0x4C;
+    private const byte VirtualKeyPeriod = 0xBE;
+    private const uint ClipboardUnicodeText = 13;
 
     private static void Main()
     {
@@ -28,7 +42,7 @@ internal static class Program
 
         OpenChromeWindow();
         Thread.Sleep(ChromeLaunchDelayMilliseconds);
-        MoveToAddressBarAndHighlight();
+        MoveToAddressBarAndNavigate();
     }
 
     private static void OpenChromeWindow()
@@ -52,7 +66,7 @@ internal static class Program
         }
     }
 
-    private static void MoveToAddressBarAndHighlight()
+    private static void MoveToAddressBarAndNavigate()
     {
         if (!GetCursorPos(out var start))
         {
@@ -82,17 +96,168 @@ internal static class Program
         mouse_event(MouseEventLeftUp, 0, 0, 0, UIntPtr.Zero);
         Thread.Sleep(PostClickKeyboardDelayMilliseconds);
         SelectAllWithKeyboard();
+        Thread.Sleep(Random.Shared.Next(90, 220));
+
+        PressKeyHumanLike(VirtualKeyDelete);
+        Thread.Sleep(Random.Shared.Next(140, 280));
+        TypeTextHumanLike(TargetUrl);
+        Thread.Sleep(Random.Shared.Next(100, 220));
+        PressKeyHumanLike(VirtualKeyEscape);
+        Thread.Sleep(Random.Shared.Next(90, 180));
+        EnsureAddressBarContainsTargetUrl();
+        Thread.Sleep(Random.Shared.Next(120, 260));
+        PressKeyHumanLike(VirtualKeyEnter);
 
         SetCursorPos(start.X, start.Y);
-        Console.WriteLine($"Clicked address bar at X={addressX}, Y={addressY} and highlighted text.");
+        Console.WriteLine($"Clicked address bar at X={addressX}, Y={addressY}, typed {TargetUrl}, and pressed Enter.");
     }
 
     private static void SelectAllWithKeyboard()
     {
+        PressCtrlComboHumanLike(VirtualKeyA);
+    }
+
+    private static void PressKeyHumanLike(byte virtualKey)
+    {
+        keybd_event(virtualKey, 0, 0, UIntPtr.Zero);
+        Thread.Sleep(Random.Shared.Next(MinKeyDownMilliseconds, MaxKeyDownMilliseconds + 1));
+        keybd_event(virtualKey, 0, KeyEventKeyUp, UIntPtr.Zero);
+    }
+
+    private static void PressCtrlComboHumanLike(byte virtualKey)
+    {
         keybd_event(VirtualKeyControl, 0, 0, UIntPtr.Zero);
-        keybd_event(VirtualKeyA, 0, 0, UIntPtr.Zero);
-        keybd_event(VirtualKeyA, 0, KeyEventKeyUp, UIntPtr.Zero);
+        Thread.Sleep(Random.Shared.Next(30, 75));
+        keybd_event(virtualKey, 0, 0, UIntPtr.Zero);
+        Thread.Sleep(Random.Shared.Next(MinKeyDownMilliseconds, MaxKeyDownMilliseconds + 1));
+        keybd_event(virtualKey, 0, KeyEventKeyUp, UIntPtr.Zero);
+        Thread.Sleep(Random.Shared.Next(20, 60));
         keybd_event(VirtualKeyControl, 0, KeyEventKeyUp, UIntPtr.Zero);
+    }
+
+    private static void EnsureAddressBarContainsTargetUrl()
+    {
+        PressCtrlComboHumanLike(VirtualKeyL);
+        Thread.Sleep(Random.Shared.Next(70, 170));
+        PressCtrlComboHumanLike(VirtualKeyC);
+        Thread.Sleep(Random.Shared.Next(100, 200));
+
+        var copiedText = ReadClipboardTextWithRetries();
+        if (UrlTextMatchesTarget(copiedText))
+        {
+            return;
+        }
+
+        SelectAllWithKeyboard();
+        Thread.Sleep(Random.Shared.Next(80, 180));
+        PressKeyHumanLike(VirtualKeyDelete);
+        Thread.Sleep(Random.Shared.Next(120, 240));
+        TypeTextHumanLike(TargetUrl);
+        Thread.Sleep(Random.Shared.Next(70, 160));
+        PressKeyHumanLike(VirtualKeyEscape);
+    }
+
+    private static bool UrlTextMatchesTarget(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+
+        var normalized = text.Trim().ToLowerInvariant();
+        normalized = normalized.Replace("https://", string.Empty).Replace("http://", string.Empty);
+        normalized = normalized.TrimEnd('/');
+        return normalized == TargetUrl;
+    }
+
+    private static string? ReadClipboardTextWithRetries()
+    {
+        for (var i = 0; i < ClipboardReadRetries; i++)
+        {
+            var text = TryReadClipboardUnicodeText();
+            if (!string.IsNullOrWhiteSpace(text))
+            {
+                return text;
+            }
+
+            Thread.Sleep(ClipboardReadRetryDelayMilliseconds);
+        }
+
+        return null;
+    }
+
+    private static string? TryReadClipboardUnicodeText()
+    {
+        if (!OpenClipboard(IntPtr.Zero))
+        {
+            return null;
+        }
+
+        try
+        {
+            var clipboardData = GetClipboardData(ClipboardUnicodeText);
+            if (clipboardData == IntPtr.Zero)
+            {
+                return null;
+            }
+
+            var pointer = GlobalLock(clipboardData);
+            if (pointer == IntPtr.Zero)
+            {
+                return null;
+            }
+
+            try
+            {
+                return Marshal.PtrToStringUni(pointer);
+            }
+            finally
+            {
+                GlobalUnlock(clipboardData);
+            }
+        }
+        finally
+        {
+            CloseClipboard();
+        }
+    }
+
+    private static void TypeTextHumanLike(string text)
+    {
+        foreach (var character in text)
+        {
+            if (!TryGetVirtualKeyForCharacter(character, out var virtualKey))
+            {
+                continue;
+            }
+
+            PressKeyHumanLike(virtualKey);
+            Thread.Sleep(Random.Shared.Next(MinInterKeyDelayMilliseconds, MaxInterKeyDelayMilliseconds + 1));
+        }
+    }
+
+    private static bool TryGetVirtualKeyForCharacter(char character, out byte virtualKey)
+    {
+        if (character is >= 'a' and <= 'z')
+        {
+            virtualKey = (byte)char.ToUpperInvariant(character);
+            return true;
+        }
+
+        if (character is >= 'A' and <= 'Z')
+        {
+            virtualKey = (byte)character;
+            return true;
+        }
+
+        if (character == '.')
+        {
+            virtualKey = VirtualKeyPeriod;
+            return true;
+        }
+
+        virtualKey = 0;
+        return false;
     }
 
     private static bool MoveCursorSmoothly(int fromX, int fromY, int toX, int toY)
@@ -169,6 +334,24 @@ internal static class Program
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool OpenClipboard(IntPtr hWndNewOwner);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseClipboard();
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr GetClipboardData(uint uFormat);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr GlobalLock(IntPtr hMem);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GlobalUnlock(IntPtr hMem);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct Point
