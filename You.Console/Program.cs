@@ -5,15 +5,18 @@ internal static class Program
 {
     private const int ChromeLaunchDelayMilliseconds = 2500;
     private const int MouseClickDelayMilliseconds = 900;
+    private const int PostClickKeyboardDelayMilliseconds = 120;
     private const int CursorMoveSteps = 150;
     private const int MinCursorMoveStepDelayMilliseconds = 10;
     private const int MaxCursorMoveStepDelayMilliseconds = 28;
     private const double MaxArcHeightPixels = 70.0;
     private const double EndJitterPixels = 1.5;
-    private const int CloseButtonOffsetFromRight = 16;
-    private const int CloseButtonOffsetFromTop = 16;
+    private const int AddressBarOffsetFromTop = 50;
     private const uint MouseEventLeftDown = 0x0002;
     private const uint MouseEventLeftUp = 0x0004;
+    private const uint KeyEventKeyUp = 0x0002;
+    private const byte VirtualKeyControl = 0x11;
+    private const byte VirtualKeyA = 0x41;
 
     private static void Main()
     {
@@ -25,7 +28,7 @@ internal static class Program
 
         OpenChromeWindow();
         Thread.Sleep(ChromeLaunchDelayMilliseconds);
-        MoveToWindowCloseAndClick();
+        MoveToAddressBarAndHighlight();
     }
 
     private static void OpenChromeWindow()
@@ -49,7 +52,7 @@ internal static class Program
         }
     }
 
-    private static void MoveToWindowCloseAndClick()
+    private static void MoveToAddressBarAndHighlight()
     {
         if (!GetCursorPos(out var start))
         {
@@ -64,21 +67,32 @@ internal static class Program
             return;
         }
 
-        var closeX = windowRect.Right - CloseButtonOffsetFromRight;
-        var closeY = windowRect.Top + CloseButtonOffsetFromTop;
+        var windowWidth = windowRect.Right - windowRect.Left;
+        var addressX = windowRect.Left + Math.Clamp((int)(windowWidth * 0.42), 220, Math.Max(220, windowWidth - 120));
+        var addressY = windowRect.Top + AddressBarOffsetFromTop;
 
-        if (!MoveCursorSmoothly(start.X, start.Y, closeX, closeY))
+        if (!MoveCursorSmoothly(start.X, start.Y, addressX, addressY))
         {
-            Console.WriteLine("Could not move cursor to the close button.");
+            Console.WriteLine("Could not move cursor to the address bar.");
             return;
         }
 
         Thread.Sleep(MouseClickDelayMilliseconds);
         mouse_event(MouseEventLeftDown, 0, 0, 0, UIntPtr.Zero);
         mouse_event(MouseEventLeftUp, 0, 0, 0, UIntPtr.Zero);
+        Thread.Sleep(PostClickKeyboardDelayMilliseconds);
+        SelectAllWithKeyboard();
 
         SetCursorPos(start.X, start.Y);
-        Console.WriteLine($"Clicked close button at X={closeX}, Y={closeY}.");
+        Console.WriteLine($"Clicked address bar at X={addressX}, Y={addressY} and highlighted text.");
+    }
+
+    private static void SelectAllWithKeyboard()
+    {
+        keybd_event(VirtualKeyControl, 0, 0, UIntPtr.Zero);
+        keybd_event(VirtualKeyA, 0, 0, UIntPtr.Zero);
+        keybd_event(VirtualKeyA, 0, KeyEventKeyUp, UIntPtr.Zero);
+        keybd_event(VirtualKeyControl, 0, KeyEventKeyUp, UIntPtr.Zero);
     }
 
     private static bool MoveCursorSmoothly(int fromX, int fromY, int toX, int toY)
@@ -152,6 +166,9 @@ internal static class Program
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct Point
