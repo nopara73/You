@@ -98,3 +98,4 @@ C:\Users\user\Desktop\You\You.Tests\obj\Debug\net10.0\refint\You.Tests.dll
 C:\Users\user\Desktop\You\You.Tests\obj\Debug\net10.0\You.Tests.pdb
 C:\Users\user\Desktop\You\You.Tests\obj\Debug\net10.0\You.Tests.genruntimeconfig.cache
 C:\Users\user\Desktop\You\You.Tests\obj\Debug\net10.0\ref\You.Tests.dll
+C:\Users\user\Desktop\You\You.Tests\obj\Debug\net10.0\You.Tests.sourcelink.json

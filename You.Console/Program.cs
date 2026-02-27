@@ -1,6 +1,8 @@
+using System.Text;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using System.Diagnostics;
+using System.Text.Json;
 using Microsoft.Win32;
 using You.Library;
 
@@ -32,6 +34,7 @@ internal static class Program
     private const uint MouseEventLeftDown = 0x0002;
     private const uint MouseEventLeftUp = 0x0004;
     private const uint KeyEventKeyUp = 0x0002;
+    private const byte VirtualKeySpace = 0x20;
     private const byte VirtualKeyControl = 0x11;
     private const byte VirtualKeyA = 0x41;
     private const byte VirtualKeyC = 0x43;
@@ -40,6 +43,35 @@ internal static class Program
     private const byte VirtualKeyEscape = 0x1B;
     private const byte VirtualKeyL = 0x4C;
     private const uint ClipboardUnicodeText = 13;
+    private const int AutomationLoopDelayMilliseconds = 1200;
+    private const int EscapePollIntervalMilliseconds = 10;
+    private const int TerminalWindowAttachTimeoutMilliseconds = 4000;
+    private const int TerminalWindowAttachPollMilliseconds = 50;
+    private const int SyntheticEscapeIgnoreMilliseconds = 75;
+    private const int SwRestore = 9;
+    private const int WhKeyboardLl = 13;
+    private const int WmKeyDown = 0x0100;
+    private const int WmSysKeyDown = 0x0104;
+    private const uint LlkhfInjected = 0x00000010;
+    private const uint AttachParentProcess = 0xFFFFFFFF;
+    private const int StdOutputHandle = -11;
+    private const string DebugLogPath = @"C:\Users\user\Desktop\You\debug-1541d6.log";
+    private const string DebugSessionId = "1541d6";
+
+    private static volatile bool pauseRequested;
+    private static volatile bool exitRequested;
+    private static DateTime ignoreEscapeUntilUtc;
+    private static IntPtr pauseTerminalWindow;
+    private static string? pauseTerminalWindowTitle;
+    private static int pauseTerminalProcessId;
+    private static bool pauseTerminalLaunchedByApp;
+    private static IntPtr keyboardHookHandle;
+    private static Thread? keyboardHookThread;
+    private static HookProc? keyboardHookProc;
+    private static int escapePressCount;
+    private static int consumedEscapePressCount;
+    private static int shutdownMessagePrinted;
+    private static int shutdownMessageWrittenToPauseTerminal;
 
     private static void Main()
     {
@@ -49,7 +81,600 @@ internal static class Program
             return;
         }
 
+        RunAutomationUntilExplicitExit();
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static void RunAutomationUntilExplicitExit()
+    {
+        StartGlobalEscapeHook();
         OpenDefaultBrowser(TargetUrl);
+        Console.WriteLine("Press Esc to pause and open terminal. Press Esc again in terminal to stop.");
+
+        while (!exitRequested)
+        {
+            PollEscapeHotkey();
+            if (exitRequested)
+            {
+                break;
+            }
+
+            if (pauseRequested)
+            {
+                BringTerminalToFront();
+                WaitForTerminalEscapeToExit();
+                continue;
+            }
+
+            MoveToAddressBarAndNavigate();
+            InterruptibleSleep(AutomationLoopDelayMilliseconds);
+        }
+
+        EnsureShutdownMessageVisibleInPauseTerminal();
+        ClosePauseTerminalIfOwned();
+        Console.WriteLine("Stopped.");
+        StopGlobalEscapeHook();
+    }
+
+    private static void PollEscapeHotkey()
+    {
+        if (DateTime.UtcNow < ignoreEscapeUntilUtc)
+        {
+            return;
+        }
+
+        var hasNewEscapePress = TryConsumeEscapePress();
+        if (hasNewEscapePress && !pauseRequested)
+        {
+            pauseRequested = true;
+            ignoreEscapeUntilUtc = DateTime.UtcNow.AddMilliseconds(SyntheticEscapeIgnoreMilliseconds);
+            Console.WriteLine("Paused current action. Terminal opened. Press Esc again here to stop.");
+        }
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static void WaitForTerminalEscapeToExit()
+    {
+        while (!exitRequested)
+        {
+            var hasNewEscapePress = TryConsumeEscapePress();
+            if (hasNewEscapePress)
+            {
+                PrintShutdownMessageOnce();
+                exitRequested = true;
+                return;
+            }
+
+            Thread.Sleep(EscapePollIntervalMilliseconds);
+        }
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static void BringTerminalToFront()
+    {
+        pauseTerminalWindow = GetConsoleWindow();
+        if (pauseTerminalWindow != IntPtr.Zero)
+        {
+            pauseTerminalWindowTitle = GetWindowTitle(pauseTerminalWindow);
+            pauseTerminalLaunchedByApp = false;
+            pauseTerminalProcessId = 0;
+        }
+
+        if (pauseTerminalWindow == IntPtr.Zero)
+        {
+            pauseTerminalWindow = StartPauseTerminalWindow();
+        }
+
+        if (pauseTerminalWindow == IntPtr.Zero)
+        {
+            #region agent log
+            DebugLog(
+                "run1",
+                "H6",
+                "Program.cs:169",
+                "No consultation window handle; falling back to process detection",
+                $"pauseTerminalPid={pauseTerminalProcessId};title={pauseTerminalWindowTitle}");
+            #endregion
+            Console.WriteLine("Terminal opened, but focus tracking will use process detection.");
+            return;
+        }
+
+        ShowWindow(pauseTerminalWindow, SwRestore);
+        SetForegroundWindow(pauseTerminalWindow);
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static IntPtr StartPauseTerminalWindow()
+    {
+        try
+        {
+            pauseTerminalWindowTitle = "Consultation";
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = "cmd.exe",
+                Arguments = $"/k title {pauseTerminalWindowTitle} & cls & prompt $$$S",
+                UseShellExecute = true
+            };
+
+            var terminalProcess = Process.Start(startInfo);
+            if (terminalProcess is null)
+            {
+                return IntPtr.Zero;
+            }
+
+            pauseTerminalLaunchedByApp = true;
+            pauseTerminalProcessId = terminalProcess.Id;
+            #region agent log
+            DebugLog(
+                "run1",
+                "H1",
+                "Program.cs:197",
+                "Started consultation terminal process",
+                $"pid={pauseTerminalProcessId};title={pauseTerminalWindowTitle};args={startInfo.Arguments};useShellExecute={startInfo.UseShellExecute}");
+            #endregion
+
+            var deadline = DateTime.UtcNow.AddMilliseconds(TerminalWindowAttachTimeoutMilliseconds);
+            while (DateTime.UtcNow < deadline)
+            {
+                terminalProcess.Refresh();
+                if (terminalProcess.MainWindowHandle != IntPtr.Zero)
+                {
+                    #region agent log
+                    DebugLog(
+                        "run1",
+                        "H6",
+                        "Program.cs:214",
+                        "Consultation terminal main window handle attached",
+                        $"pid={pauseTerminalProcessId};handle={terminalProcess.MainWindowHandle}");
+                    #endregion
+                    return terminalProcess.MainWindowHandle;
+                }
+
+                Thread.Sleep(TerminalWindowAttachPollMilliseconds);
+            }
+        }
+        catch
+        {
+            // Ignore launch errors and fall back gracefully.
+        }
+
+        return IntPtr.Zero;
+    }
+
+    private static void ClosePauseTerminalIfOwned()
+    {
+        if (!pauseTerminalLaunchedByApp || pauseTerminalProcessId <= 0)
+        {
+            return;
+        }
+
+        try
+        {
+            using var process = Process.GetProcessById(pauseTerminalProcessId);
+            if (process.HasExited)
+            {
+                return;
+            }
+
+            #region agent log
+            DebugLog(
+                "run1",
+                "H5",
+                "Program.cs:241",
+                "Killing consultation terminal process",
+                $"pid={pauseTerminalProcessId};hasExited={process.HasExited}");
+            #endregion
+            process.Kill(entireProcessTree: true);
+        }
+        catch
+        {
+            // Best effort cleanup; app shutdown should still continue.
+        }
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static bool IsPauseTerminalFocused()
+    {
+        var foregroundWindow = GetForegroundWindow();
+        if (foregroundWindow == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        if (pauseTerminalWindow != IntPtr.Zero && foregroundWindow == pauseTerminalWindow)
+        {
+            return true;
+        }
+
+        var title = GetWindowTitle(foregroundWindow);
+        if (!string.IsNullOrWhiteSpace(pauseTerminalWindowTitle) &&
+            title.Contains(pauseTerminalWindowTitle, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (GetWindowThreadProcessId(foregroundWindow, out var processId) == 0)
+        {
+            return false;
+        }
+
+        try
+        {
+            using var process = Process.GetProcessById((int)processId);
+            var processName = process.ProcessName;
+            return processName.Equals("cmd", StringComparison.OrdinalIgnoreCase) ||
+                processName.Equals("powershell", StringComparison.OrdinalIgnoreCase) ||
+                processName.Equals("pwsh", StringComparison.OrdinalIgnoreCase) ||
+                processName.Equals("WindowsTerminal", StringComparison.OrdinalIgnoreCase) ||
+                processName.Equals("conhost", StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static string GetWindowTitle(IntPtr windowHandle)
+    {
+        const int titleBufferSize = 512;
+        var builder = new StringBuilder(titleBufferSize);
+        _ = GetWindowText(windowHandle, builder, builder.Capacity);
+        return builder.ToString();
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static void StartGlobalEscapeHook()
+    {
+        if (keyboardHookThread is not null)
+        {
+            return;
+        }
+
+        keyboardHookThread = new Thread(() =>
+        {
+            keyboardHookProc = KeyboardHookCallback;
+            keyboardHookHandle = SetWindowsHookEx(WhKeyboardLl, keyboardHookProc, IntPtr.Zero, 0);
+            if (keyboardHookHandle == IntPtr.Zero)
+            {
+                return;
+            }
+
+            while (GetMessage(out _, IntPtr.Zero, 0, 0) != 0)
+            {
+            }
+
+            UnhookWindowsHookEx(keyboardHookHandle);
+            keyboardHookHandle = IntPtr.Zero;
+        })
+        {
+            IsBackground = true,
+            Name = "You.GlobalEscapeHookThread"
+        };
+
+        keyboardHookThread.Start();
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static void StopGlobalEscapeHook()
+    {
+        if (keyboardHookThread is null)
+        {
+            return;
+        }
+
+        try
+        {
+            keyboardHookThread.Interrupt();
+        }
+        catch
+        {
+            // Ignore thread interruption failures.
+        }
+    }
+
+    private static bool TryConsumeEscapePress()
+    {
+        var currentCount = Volatile.Read(ref escapePressCount);
+        if (currentCount <= consumedEscapePressCount)
+        {
+            return false;
+        }
+
+        consumedEscapePressCount = currentCount;
+        return true;
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static IntPtr KeyboardHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0 && (wParam == (IntPtr)WmKeyDown || wParam == (IntPtr)WmSysKeyDown))
+        {
+            var keyboardData = Marshal.PtrToStructure<KbdLlHookStruct>(lParam);
+            if ((keyboardData.Flags & LlkhfInjected) != 0)
+            {
+                return CallNextHookEx(keyboardHookHandle, nCode, wParam, lParam);
+            }
+
+            if (keyboardData.VkCode == VirtualKeyEscape &&
+                (pauseRequested || DateTime.UtcNow >= ignoreEscapeUntilUtc))
+            {
+                Interlocked.Increment(ref escapePressCount);
+                if (pauseRequested)
+                {
+                    #region agent log
+                    DebugLog(
+                        "run1",
+                        "H2",
+                        "Program.cs:379",
+                        "Esc detected while paused",
+                        $"threadId={Environment.CurrentManagedThreadId};escapePressCount={Volatile.Read(ref escapePressCount)};pauseTerminalPid={pauseTerminalProcessId}");
+                    #endregion
+                    PrintShutdownMessageOnce();
+                    exitRequested = true;
+                }
+            }
+        }
+
+        return CallNextHookEx(keyboardHookHandle, nCode, wParam, lParam);
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static void PrintShutdownMessageOnce()
+    {
+        if (Interlocked.Exchange(ref shutdownMessagePrinted, 1) == 1)
+        {
+            return;
+        }
+
+        var shutdownMessage = $"{Environment.NewLine}{Environment.NewLine}{Environment.NewLine}Esc detected. Shutting down...";
+        if (TryWriteToPauseTerminal(shutdownMessage))
+        {
+            Interlocked.Exchange(ref shutdownMessageWrittenToPauseTerminal, 1);
+            return;
+        }
+
+        if (TryTypeShutdownMessageIntoFocusedTerminal())
+        {
+            Interlocked.Exchange(ref shutdownMessageWrittenToPauseTerminal, 1);
+            return;
+        }
+
+        Console.WriteLine(shutdownMessage);
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static void EnsureShutdownMessageVisibleInPauseTerminal()
+    {
+        if (Volatile.Read(ref shutdownMessagePrinted) == 0)
+        {
+            return;
+        }
+
+        if (Volatile.Read(ref shutdownMessageWrittenToPauseTerminal) == 1)
+        {
+            return;
+        }
+
+        var shutdownMessage = $"{Environment.NewLine}{Environment.NewLine}{Environment.NewLine}Esc detected. Shutting down...";
+        #region agent log
+        DebugLog(
+            "run1",
+            "H5",
+            "Program.cs:435",
+            "Shutdown message retry requested from main shutdown path",
+            $"printed={Volatile.Read(ref shutdownMessagePrinted)};writtenToPauseTerminal={Volatile.Read(ref shutdownMessageWrittenToPauseTerminal)};pauseTerminalPid={pauseTerminalProcessId}");
+        #endregion
+        if (TryWriteToPauseTerminal(shutdownMessage))
+        {
+            Interlocked.Exchange(ref shutdownMessageWrittenToPauseTerminal, 1);
+            return;
+        }
+
+        if (TryTypeShutdownMessageIntoFocusedTerminal())
+        {
+            Interlocked.Exchange(ref shutdownMessageWrittenToPauseTerminal, 1);
+        }
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static bool TryWriteToPauseTerminal(string message)
+    {
+        if (!pauseTerminalLaunchedByApp || pauseTerminalProcessId <= 0)
+        {
+            return false;
+        }
+
+        var hadExistingConsole = GetConsoleWindow() != IntPtr.Zero;
+        var attachedToPauseTerminal = false;
+        var detachedBeforeAttach = false;
+
+        try
+        {
+            var freeConsoleResult = FreeConsole();
+            var freeConsoleError = Marshal.GetLastWin32Error();
+            detachedBeforeAttach = freeConsoleResult;
+            #region agent log
+            DebugLog(
+                "run1",
+                "H10",
+                "Program.cs:497",
+                "Pre-attach FreeConsole result",
+                $"hadExistingConsole={hadExistingConsole};freeConsoleResult={freeConsoleResult};win32Error={freeConsoleError}");
+            #endregion
+
+            #region agent log
+            DebugLog(
+                "run1",
+                "H3",
+                "Program.cs:465",
+                "Attempting AttachConsole to consultation terminal",
+                $"hadExistingConsole={hadExistingConsole};targetPid={pauseTerminalProcessId}");
+            #endregion
+            if (!AttachConsole((uint)pauseTerminalProcessId))
+            {
+                #region agent log
+                DebugLog(
+                    "run1",
+                    "H3",
+                    "Program.cs:474",
+                    "AttachConsole failed",
+                    $"targetPid={pauseTerminalProcessId};win32Error={Marshal.GetLastWin32Error()}");
+                #endregion
+                return false;
+            }
+
+            attachedToPauseTerminal = true;
+            var writeSucceeded = WriteLineToAttachedConsole(message);
+            #region agent log
+            DebugLog(
+                "run1",
+                "H4",
+                "Program.cs:486",
+                "WriteLineToAttachedConsole completed",
+                $"targetPid={pauseTerminalProcessId};writeSucceeded={writeSucceeded};win32Error={Marshal.GetLastWin32Error()}");
+            #endregion
+            return writeSucceeded;
+        }
+        catch
+        {
+            return false;
+        }
+        finally
+        {
+            if (attachedToPauseTerminal)
+            {
+                _ = FreeConsole();
+            }
+
+            if (hadExistingConsole || detachedBeforeAttach)
+            {
+                _ = AttachConsole(AttachParentProcess);
+            }
+        }
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static bool WriteLineToAttachedConsole(string message)
+    {
+        var outputHandle = GetStdHandle(StdOutputHandle);
+        if (outputHandle == IntPtr.Zero || outputHandle == new IntPtr(-1))
+        {
+            return false;
+        }
+
+        var text = $"{message}{Environment.NewLine}";
+        return WriteConsole(outputHandle, text, (uint)text.Length, out _, IntPtr.Zero);
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static bool TryTypeShutdownMessageIntoFocusedTerminal()
+    {
+        if (!pauseRequested)
+        {
+            return false;
+        }
+
+        var foregroundWindow = GetForegroundWindow();
+        var foregroundTitle = foregroundWindow == IntPtr.Zero ? string.Empty : GetWindowTitle(foregroundWindow);
+        #region agent log
+        DebugLog(
+            "run1",
+            "H8",
+            "Program.cs:528",
+            "Attempting keystroke fallback into focused terminal",
+            $"foregroundTitle={foregroundTitle};pauseTerminalTitle={pauseTerminalWindowTitle};pauseTerminalPid={pauseTerminalProcessId}");
+        #endregion
+        if (string.IsNullOrWhiteSpace(foregroundTitle) ||
+            !foregroundTitle.Contains("Consultation", StringComparison.OrdinalIgnoreCase))
+        {
+            #region agent log
+            DebugLog(
+                "run1",
+                "H8",
+                "Program.cs:538",
+                "Keystroke fallback skipped due to non-consultation foreground window",
+                $"foregroundTitle={foregroundTitle};pauseTerminalTitle={pauseTerminalWindowTitle}");
+            #endregion
+            return false;
+        }
+
+        const string shortMessage = "echo.&echo.&echo.&echo exited.";
+        foreach (var character in shortMessage)
+        {
+            if (!TryGetVirtualKeyForTerminalFallback(character, out var virtualKey))
+            {
+                return false;
+            }
+
+            keybd_event(virtualKey, 0, 0, UIntPtr.Zero);
+            keybd_event(virtualKey, 0, KeyEventKeyUp, UIntPtr.Zero);
+        }
+
+        keybd_event(VirtualKeyEnter, 0, 0, UIntPtr.Zero);
+        keybd_event(VirtualKeyEnter, 0, KeyEventKeyUp, UIntPtr.Zero);
+        #region agent log
+        DebugLog(
+            "run1",
+            "H9",
+            "Program.cs:558",
+            "Keystroke fallback message injected",
+            $"text={shortMessage};pauseTerminalPid={pauseTerminalProcessId}");
+        #endregion
+        return true;
+    }
+
+    private static bool TryGetVirtualKeyForTerminalFallback(char character, out byte virtualKey)
+    {
+        if (character == ' ')
+        {
+            virtualKey = VirtualKeySpace;
+            return true;
+        }
+
+        return BrowserInputLogic.TryGetVirtualKeyForCharacter(character, out virtualKey);
+    }
+
+    private static void DebugLog(string runId, string hypothesisId, string location, string message, string data)
+    {
+        try
+        {
+            var payload = new
+            {
+                sessionId = DebugSessionId,
+                runId,
+                hypothesisId,
+                location,
+                message,
+                data,
+                timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+            };
+
+            File.AppendAllText(DebugLogPath, JsonSerializer.Serialize(payload) + Environment.NewLine);
+        }
+        catch
+        {
+            // Ignore logging failures in debug mode.
+        }
+    }
+
+    private static bool InterruptibleSleep(int totalMilliseconds)
+    {
+        var remaining = totalMilliseconds;
+        while (remaining > 0)
+        {
+            PollEscapeHotkey();
+            if (pauseRequested || exitRequested)
+            {
+                return false;
+            }
+
+            var delay = Math.Min(EscapePollIntervalMilliseconds, remaining);
+            Thread.Sleep(delay);
+            remaining -= delay;
+        }
+
+        return true;
     }
 
     [SupportedOSPlatform("windows")]
@@ -296,6 +921,11 @@ internal static class Program
 
     private static void MoveToAddressBarAndNavigate()
     {
+        if (pauseRequested || exitRequested)
+        {
+            return;
+        }
+
         if (!GetCursorPos(out var start))
         {
             Console.WriteLine("Could not read cursor position.");
@@ -319,21 +949,48 @@ internal static class Program
             return;
         }
 
-        Thread.Sleep(MouseClickDelayMilliseconds);
+        if (!InterruptibleSleep(MouseClickDelayMilliseconds))
+        {
+            return;
+        }
+
         mouse_event(MouseEventLeftDown, 0, 0, 0, UIntPtr.Zero);
         mouse_event(MouseEventLeftUp, 0, 0, 0, UIntPtr.Zero);
-        Thread.Sleep(PostClickKeyboardDelayMilliseconds);
+        if (!InterruptibleSleep(PostClickKeyboardDelayMilliseconds))
+        {
+            return;
+        }
+
         SelectAllWithKeyboard();
-        Thread.Sleep(Random.Shared.Next(90, 220));
+        if (!InterruptibleSleep(Random.Shared.Next(90, 220)))
+        {
+            return;
+        }
 
         PressKeyHumanLike(VirtualKeyDelete);
-        Thread.Sleep(Random.Shared.Next(140, 280));
+        if (!InterruptibleSleep(Random.Shared.Next(140, 280)))
+        {
+            return;
+        }
+
         TypeTextHumanLike(TargetUrl);
-        Thread.Sleep(Random.Shared.Next(100, 220));
+        if (!InterruptibleSleep(Random.Shared.Next(100, 220)))
+        {
+            return;
+        }
+
         PressKeyHumanLike(VirtualKeyEscape);
-        Thread.Sleep(Random.Shared.Next(90, 180));
+        if (!InterruptibleSleep(Random.Shared.Next(90, 180)))
+        {
+            return;
+        }
+
         EnsureAddressBarContainsTargetUrl();
-        Thread.Sleep(Random.Shared.Next(120, 260));
+        if (!InterruptibleSleep(Random.Shared.Next(120, 260)))
+        {
+            return;
+        }
+
         PressKeyHumanLike(VirtualKeyEnter);
 
         SetCursorPos(start.X, start.Y);
@@ -347,28 +1004,70 @@ internal static class Program
 
     private static void PressKeyHumanLike(byte virtualKey)
     {
+        if (pauseRequested || exitRequested)
+        {
+            return;
+        }
+
+        if (virtualKey == VirtualKeyEscape)
+        {
+            ignoreEscapeUntilUtc = DateTime.UtcNow.AddMilliseconds(SyntheticEscapeIgnoreMilliseconds);
+        }
+
         keybd_event(virtualKey, 0, 0, UIntPtr.Zero);
-        Thread.Sleep(Random.Shared.Next(MinKeyDownMilliseconds, MaxKeyDownMilliseconds + 1));
+        if (!InterruptibleSleep(Random.Shared.Next(MinKeyDownMilliseconds, MaxKeyDownMilliseconds + 1)))
+        {
+            return;
+        }
+
         keybd_event(virtualKey, 0, KeyEventKeyUp, UIntPtr.Zero);
     }
 
     private static void PressCtrlComboHumanLike(byte virtualKey)
     {
+        if (pauseRequested || exitRequested)
+        {
+            return;
+        }
+
         keybd_event(VirtualKeyControl, 0, 0, UIntPtr.Zero);
-        Thread.Sleep(Random.Shared.Next(30, 75));
+        if (!InterruptibleSleep(Random.Shared.Next(30, 75)))
+        {
+            keybd_event(VirtualKeyControl, 0, KeyEventKeyUp, UIntPtr.Zero);
+            return;
+        }
+
         keybd_event(virtualKey, 0, 0, UIntPtr.Zero);
-        Thread.Sleep(Random.Shared.Next(MinKeyDownMilliseconds, MaxKeyDownMilliseconds + 1));
+        if (!InterruptibleSleep(Random.Shared.Next(MinKeyDownMilliseconds, MaxKeyDownMilliseconds + 1)))
+        {
+            keybd_event(virtualKey, 0, KeyEventKeyUp, UIntPtr.Zero);
+            keybd_event(VirtualKeyControl, 0, KeyEventKeyUp, UIntPtr.Zero);
+            return;
+        }
+
         keybd_event(virtualKey, 0, KeyEventKeyUp, UIntPtr.Zero);
-        Thread.Sleep(Random.Shared.Next(20, 60));
+        if (!InterruptibleSleep(Random.Shared.Next(20, 60)))
+        {
+            keybd_event(VirtualKeyControl, 0, KeyEventKeyUp, UIntPtr.Zero);
+            return;
+        }
+
         keybd_event(VirtualKeyControl, 0, KeyEventKeyUp, UIntPtr.Zero);
     }
 
     private static void EnsureAddressBarContainsTargetUrl()
     {
         PressCtrlComboHumanLike(VirtualKeyL);
-        Thread.Sleep(Random.Shared.Next(70, 170));
+        if (!InterruptibleSleep(Random.Shared.Next(70, 170)))
+        {
+            return;
+        }
+
         PressCtrlComboHumanLike(VirtualKeyC);
-        Thread.Sleep(Random.Shared.Next(100, 200));
+        if (!InterruptibleSleep(Random.Shared.Next(100, 200)))
+        {
+            return;
+        }
 
         var copiedText = ReadClipboardTextWithRetries();
         if (BrowserInputLogic.UrlTextMatchesTarget(copiedText, TargetUrl))
@@ -377,11 +1076,23 @@ internal static class Program
         }
 
         SelectAllWithKeyboard();
-        Thread.Sleep(Random.Shared.Next(80, 180));
+        if (!InterruptibleSleep(Random.Shared.Next(80, 180)))
+        {
+            return;
+        }
+
         PressKeyHumanLike(VirtualKeyDelete);
-        Thread.Sleep(Random.Shared.Next(120, 240));
+        if (!InterruptibleSleep(Random.Shared.Next(120, 240)))
+        {
+            return;
+        }
+
         TypeTextHumanLike(TargetUrl);
-        Thread.Sleep(Random.Shared.Next(70, 160));
+        if (!InterruptibleSleep(Random.Shared.Next(70, 160)))
+        {
+            return;
+        }
+
         PressKeyHumanLike(VirtualKeyEscape);
     }
 
@@ -389,13 +1100,21 @@ internal static class Program
     {
         for (var i = 0; i < ClipboardReadRetries; i++)
         {
+            if (pauseRequested || exitRequested)
+            {
+                return null;
+            }
+
             var text = TryReadClipboardUnicodeText();
             if (!string.IsNullOrWhiteSpace(text))
             {
                 return text;
             }
 
-            Thread.Sleep(ClipboardReadRetryDelayMilliseconds);
+            if (!InterruptibleSleep(ClipboardReadRetryDelayMilliseconds))
+            {
+                return null;
+            }
         }
 
         return null;
@@ -441,13 +1160,21 @@ internal static class Program
     {
         foreach (var character in text)
         {
+            if (pauseRequested || exitRequested)
+            {
+                return;
+            }
+
             if (!BrowserInputLogic.TryGetVirtualKeyForCharacter(character, out var virtualKey))
             {
                 continue;
             }
 
             PressKeyHumanLike(virtualKey);
-            Thread.Sleep(Random.Shared.Next(MinInterKeyDelayMilliseconds, MaxInterKeyDelayMilliseconds + 1));
+            if (!InterruptibleSleep(Random.Shared.Next(MinInterKeyDelayMilliseconds, MaxInterKeyDelayMilliseconds + 1)))
+            {
+                return;
+            }
         }
     }
 
@@ -468,6 +1195,11 @@ internal static class Program
 
         for (var step = 1; step <= CursorMoveSteps; step++)
         {
+            if (pauseRequested || exitRequested)
+            {
+                return false;
+            }
+
             var t = (double)step / CursorMoveSteps;
             var easedT = BrowserInputLogic.EaseInOutCubic(t);
 
@@ -492,7 +1224,10 @@ internal static class Program
             }
 
             var delay = Random.Shared.Next(MinCursorMoveStepDelayMilliseconds, MaxCursorMoveStepDelayMilliseconds + 1);
-            Thread.Sleep(delay);
+            if (!InterruptibleSleep(delay))
+            {
+                return false;
+            }
         }
 
         return SetCursorPos(toX, toY);
@@ -537,6 +1272,53 @@ internal static class Program
     [DllImport("user32.dll", SetLastError = true)]
     private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
 
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetConsoleWindow();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AttachConsole(uint dwProcessId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool FreeConsole();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr GetStdHandle(int nStdHandle);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool WriteConsole(
+        IntPtr hConsoleOutput,
+        string lpBuffer,
+        uint nNumberOfCharsToWrite,
+        out uint lpNumberOfCharsWritten,
+        IntPtr lpReserved);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SetWindowsHookEx(int idHook, HookProc lpfn, IntPtr hMod, uint dwThreadId);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern int GetMessage(out Message lpMsg, IntPtr hWnd, uint wMsgFilterMin, uint wMsgFilterMax);
+
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool OpenClipboard(IntPtr hWndNewOwner);
@@ -570,4 +1352,28 @@ internal static class Program
         public int Right;
         public int Bottom;
     }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct KbdLlHookStruct
+    {
+        public uint VkCode;
+        public uint ScanCode;
+        public uint Flags;
+        public uint Time;
+        public UIntPtr DwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Message
+    {
+        public IntPtr HWnd;
+        public uint MessageId;
+        public UIntPtr WParam;
+        public IntPtr LParam;
+        public uint Time;
+        public Point Pt;
+        public uint LPrivate;
+    }
+
+    private delegate IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam);
 }
