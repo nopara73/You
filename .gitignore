@@ -1,22 +1,26 @@
-# Build artifacts
-**/bin/
-**/obj/
+# Build outputs
+[Bb]in/
+[Oo]bj/
 
-# User-specific files
+# .NET user files
 *.user
+*.rsuser
 *.suo
 
 # IDE folders
 .vs/
+.vscode/
+.idea/
 
-# Test and coverage outputs
+# Test and coverage artifacts
 TestResults/
 coverage/
 *.coverage
 *.coveragexml
 
-# NuGet packages folder (if used locally)
+# NuGet
 packages/
 
-# Local LLM config (contains secrets)
-You.Console/codex.config.json
+# Local app config / secrets
+You.Console/config.json
+config.json

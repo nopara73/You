@@ -96,7 +96,7 @@ internal static class Program
         if (string.IsNullOrWhiteSpace(apiKey))
         {
             Console.WriteLine("Missing Codex API key.");
-            Console.WriteLine("Create You.Console/codex.config.json from You.Console/codex.config.example.json");
+            Console.WriteLine("Update You.Console/config.json with your API key.");
             Console.WriteLine("Or set OPENAI_API_KEY as fallback.");
             return;
         }
@@ -133,6 +133,8 @@ internal static class Program
 
     private static CodexConfig LoadCodexConfig()
     {
+        EnsureConfigFileExists();
+
         foreach (var path in GetCodexConfigCandidatePaths())
         {
             if (!File.Exists(path))
@@ -176,11 +178,47 @@ internal static class Program
         };
     }
 
+    private static void EnsureConfigFileExists()
+    {
+        var preferredPath = GetPreferredConfigPath();
+        if (File.Exists(preferredPath))
+        {
+            return;
+        }
+
+        var directory = Path.GetDirectoryName(preferredPath);
+        if (!string.IsNullOrWhiteSpace(directory))
+        {
+            Directory.CreateDirectory(directory);
+        }
+
+        const string initialConfig = """
+        {
+          "apiKey": "",
+          "model": "gpt-5-codex"
+        }
+        """;
+
+        File.WriteAllText(preferredPath, initialConfig);
+        Console.WriteLine($"Created config file: {preferredPath}");
+    }
+
+    private static string GetPreferredConfigPath()
+    {
+        var repoLocalPath = Path.Combine(Directory.GetCurrentDirectory(), "You.Console", "config.json");
+        if (Directory.Exists(Path.GetDirectoryName(repoLocalPath) ?? string.Empty))
+        {
+            return repoLocalPath;
+        }
+
+        return Path.Combine(Directory.GetCurrentDirectory(), "config.json");
+    }
+
     private static IEnumerable<string> GetCodexConfigCandidatePaths()
     {
-        yield return Path.Combine(AppContext.BaseDirectory, "codex.config.json");
-        yield return Path.Combine(Directory.GetCurrentDirectory(), "codex.config.json");
-        yield return Path.Combine(Directory.GetCurrentDirectory(), "You.Console", "codex.config.json");
+        yield return Path.Combine(Directory.GetCurrentDirectory(), "You.Console", "config.json");
+        yield return Path.Combine(Directory.GetCurrentDirectory(), "config.json");
+        yield return Path.Combine(AppContext.BaseDirectory, "config.json");
     }
 
     private sealed class CodexConfig
