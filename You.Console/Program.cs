@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.Json;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using System.Diagnostics;
@@ -71,8 +72,14 @@ internal static class Program
     private static int shutdownMessagePrinted;
     private static int shutdownMessageWrittenToPauseTerminal;
 
-    private static void Main()
+    private static async Task Main(string[] args)
     {
+        if (args.Length > 0 && args[0].Equals("codex", StringComparison.OrdinalIgnoreCase))
+        {
+            await RunCodexModeAsync(args).ConfigureAwait(false);
+            return;
+        }
+
         if (!OperatingSystem.IsWindows())
         {
             Console.WriteLine("This app only supports Windows.");
@@ -80,6 +87,106 @@ internal static class Program
         }
 
         RunAutomationUntilExplicitExit();
+    }
+
+    private static async Task RunCodexModeAsync(string[] args)
+    {
+        var config = LoadCodexConfig();
+        var apiKey = config.ApiKey;
+        if (string.IsNullOrWhiteSpace(apiKey))
+        {
+            Console.WriteLine("Missing Codex API key.");
+            Console.WriteLine("Create You.Console/codex.config.json from You.Console/codex.config.example.json");
+            Console.WriteLine("Or set OPENAI_API_KEY as fallback.");
+            return;
+        }
+
+        var prompt = args.Length > 1
+            ? string.Join(' ', args.Skip(1))
+            : ReadPromptFromConsole();
+
+        if (string.IsNullOrWhiteSpace(prompt))
+        {
+            Console.WriteLine("No prompt provided.");
+            return;
+        }
+
+        try
+        {
+            var codexClient = new CodexClient();
+            var response = await codexClient.GetResponseAsync(prompt, apiKey, config.Model).ConfigureAwait(false);
+            Console.WriteLine();
+            Console.WriteLine("Codex:");
+            Console.WriteLine(response);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Codex request failed: {ex.Message}");
+        }
+    }
+
+    private static string ReadPromptFromConsole()
+    {
+        Console.WriteLine("Enter a prompt for Codex, then press Enter:");
+        return Console.ReadLine() ?? string.Empty;
+    }
+
+    private static CodexConfig LoadCodexConfig()
+    {
+        foreach (var path in GetCodexConfigCandidatePaths())
+        {
+            if (!File.Exists(path))
+            {
+                continue;
+            }
+
+            try
+            {
+                var json = File.ReadAllText(path);
+                var parsed = JsonSerializer.Deserialize<CodexConfig>(json, new JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true
+                });
+
+                if (parsed is not null)
+                {
+                    if (string.IsNullOrWhiteSpace(parsed.ApiKey))
+                    {
+                        parsed.ApiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
+                    }
+
+                    if (string.IsNullOrWhiteSpace(parsed.Model))
+                    {
+                        parsed.Model = "gpt-5-codex";
+                    }
+
+                    return parsed;
+                }
+            }
+            catch
+            {
+                // Ignore malformed config and try fallback options.
+            }
+        }
+
+        return new CodexConfig
+        {
+            ApiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY"),
+            Model = "gpt-5-codex"
+        };
+    }
+
+    private static IEnumerable<string> GetCodexConfigCandidatePaths()
+    {
+        yield return Path.Combine(AppContext.BaseDirectory, "codex.config.json");
+        yield return Path.Combine(Directory.GetCurrentDirectory(), "codex.config.json");
+        yield return Path.Combine(Directory.GetCurrentDirectory(), "You.Console", "codex.config.json");
+    }
+
+    private sealed class CodexConfig
+    {
+        public string? ApiKey { get; set; }
+        public string Model { get; set; } = "gpt-5-codex";
     }
 
     [SupportedOSPlatform("windows")]

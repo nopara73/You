@@ -17,3 +17,6 @@ coverage/
 
 # NuGet packages folder (if used locally)
 packages/
+
+# Local LLM config (contains secrets)
+You.Console/codex.config.json
