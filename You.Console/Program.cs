@@ -2,7 +2,6 @@ using System.Text;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using System.Diagnostics;
-using System.Text.Json;
 using Microsoft.Win32;
 using You.Library;
 
@@ -55,8 +54,6 @@ internal static class Program
     private const uint LlkhfInjected = 0x00000010;
     private const uint AttachParentProcess = 0xFFFFFFFF;
     private const int StdOutputHandle = -11;
-    private const string DebugLogPath = @"C:\Users\user\Desktop\You\debug-1541d6.log";
-    private const string DebugSessionId = "1541d6";
 
     private static volatile bool pauseRequested;
     private static volatile bool exitRequested;
@@ -167,14 +164,6 @@ internal static class Program
 
         if (pauseTerminalWindow == IntPtr.Zero)
         {
-            #region agent log
-            DebugLog(
-                "run1",
-                "H6",
-                "Program.cs:169",
-                "No consultation window handle; falling back to process detection",
-                $"pauseTerminalPid={pauseTerminalProcessId};title={pauseTerminalWindowTitle}");
-            #endregion
             Console.WriteLine("Terminal opened, but focus tracking will use process detection.");
             return;
         }
@@ -204,14 +193,6 @@ internal static class Program
 
             pauseTerminalLaunchedByApp = true;
             pauseTerminalProcessId = terminalProcess.Id;
-            #region agent log
-            DebugLog(
-                "run1",
-                "H1",
-                "Program.cs:197",
-                "Started consultation terminal process",
-                $"pid={pauseTerminalProcessId};title={pauseTerminalWindowTitle};args={startInfo.Arguments};useShellExecute={startInfo.UseShellExecute}");
-            #endregion
 
             var deadline = DateTime.UtcNow.AddMilliseconds(TerminalWindowAttachTimeoutMilliseconds);
             while (DateTime.UtcNow < deadline)
@@ -219,14 +200,6 @@ internal static class Program
                 terminalProcess.Refresh();
                 if (terminalProcess.MainWindowHandle != IntPtr.Zero)
                 {
-                    #region agent log
-                    DebugLog(
-                        "run1",
-                        "H6",
-                        "Program.cs:214",
-                        "Consultation terminal main window handle attached",
-                        $"pid={pauseTerminalProcessId};handle={terminalProcess.MainWindowHandle}");
-                    #endregion
                     return terminalProcess.MainWindowHandle;
                 }
 
@@ -256,14 +229,6 @@ internal static class Program
                 return;
             }
 
-            #region agent log
-            DebugLog(
-                "run1",
-                "H5",
-                "Program.cs:241",
-                "Killing consultation terminal process",
-                $"pid={pauseTerminalProcessId};hasExited={process.HasExited}");
-            #endregion
             process.Kill(entireProcessTree: true);
         }
         catch
@@ -402,14 +367,6 @@ internal static class Program
                 Interlocked.Increment(ref escapePressCount);
                 if (pauseRequested)
                 {
-                    #region agent log
-                    DebugLog(
-                        "run1",
-                        "H2",
-                        "Program.cs:379",
-                        "Esc detected while paused",
-                        $"threadId={Environment.CurrentManagedThreadId};escapePressCount={Volatile.Read(ref escapePressCount)};pauseTerminalPid={pauseTerminalProcessId}");
-                    #endregion
                     PrintShutdownMessageOnce();
                     exitRequested = true;
                 }
@@ -457,14 +414,6 @@ internal static class Program
         }
 
         var shutdownMessage = $"{Environment.NewLine}{Environment.NewLine}{Environment.NewLine}Esc detected. Shutting down...";
-        #region agent log
-        DebugLog(
-            "run1",
-            "H5",
-            "Program.cs:435",
-            "Shutdown message retry requested from main shutdown path",
-            $"printed={Volatile.Read(ref shutdownMessagePrinted)};writtenToPauseTerminal={Volatile.Read(ref shutdownMessageWrittenToPauseTerminal)};pauseTerminalPid={pauseTerminalProcessId}");
-        #endregion
         if (TryWriteToPauseTerminal(shutdownMessage))
         {
             Interlocked.Exchange(ref shutdownMessageWrittenToPauseTerminal, 1);
@@ -492,49 +441,14 @@ internal static class Program
         try
         {
             var freeConsoleResult = FreeConsole();
-            var freeConsoleError = Marshal.GetLastWin32Error();
             detachedBeforeAttach = freeConsoleResult;
-            #region agent log
-            DebugLog(
-                "run1",
-                "H10",
-                "Program.cs:497",
-                "Pre-attach FreeConsole result",
-                $"hadExistingConsole={hadExistingConsole};freeConsoleResult={freeConsoleResult};win32Error={freeConsoleError}");
-            #endregion
-
-            #region agent log
-            DebugLog(
-                "run1",
-                "H3",
-                "Program.cs:465",
-                "Attempting AttachConsole to consultation terminal",
-                $"hadExistingConsole={hadExistingConsole};targetPid={pauseTerminalProcessId}");
-            #endregion
             if (!AttachConsole((uint)pauseTerminalProcessId))
             {
-                #region agent log
-                DebugLog(
-                    "run1",
-                    "H3",
-                    "Program.cs:474",
-                    "AttachConsole failed",
-                    $"targetPid={pauseTerminalProcessId};win32Error={Marshal.GetLastWin32Error()}");
-                #endregion
                 return false;
             }
 
             attachedToPauseTerminal = true;
-            var writeSucceeded = WriteLineToAttachedConsole(message);
-            #region agent log
-            DebugLog(
-                "run1",
-                "H4",
-                "Program.cs:486",
-                "WriteLineToAttachedConsole completed",
-                $"targetPid={pauseTerminalProcessId};writeSucceeded={writeSucceeded};win32Error={Marshal.GetLastWin32Error()}");
-            #endregion
-            return writeSucceeded;
+            return WriteLineToAttachedConsole(message);
         }
         catch
         {
@@ -577,25 +491,9 @@ internal static class Program
 
         var foregroundWindow = GetForegroundWindow();
         var foregroundTitle = foregroundWindow == IntPtr.Zero ? string.Empty : GetWindowTitle(foregroundWindow);
-        #region agent log
-        DebugLog(
-            "run1",
-            "H8",
-            "Program.cs:528",
-            "Attempting keystroke fallback into focused terminal",
-            $"foregroundTitle={foregroundTitle};pauseTerminalTitle={pauseTerminalWindowTitle};pauseTerminalPid={pauseTerminalProcessId}");
-        #endregion
         if (string.IsNullOrWhiteSpace(foregroundTitle) ||
             !foregroundTitle.Contains("Consultation", StringComparison.OrdinalIgnoreCase))
         {
-            #region agent log
-            DebugLog(
-                "run1",
-                "H8",
-                "Program.cs:538",
-                "Keystroke fallback skipped due to non-consultation foreground window",
-                $"foregroundTitle={foregroundTitle};pauseTerminalTitle={pauseTerminalWindowTitle}");
-            #endregion
             return false;
         }
 
@@ -613,14 +511,6 @@ internal static class Program
 
         keybd_event(VirtualKeyEnter, 0, 0, UIntPtr.Zero);
         keybd_event(VirtualKeyEnter, 0, KeyEventKeyUp, UIntPtr.Zero);
-        #region agent log
-        DebugLog(
-            "run1",
-            "H9",
-            "Program.cs:558",
-            "Keystroke fallback message injected",
-            $"text={shortMessage};pauseTerminalPid={pauseTerminalProcessId}");
-        #endregion
         return true;
     }
 
@@ -633,29 +523,6 @@ internal static class Program
         }
 
         return BrowserInputLogic.TryGetVirtualKeyForCharacter(character, out virtualKey);
-    }
-
-    private static void DebugLog(string runId, string hypothesisId, string location, string message, string data)
-    {
-        try
-        {
-            var payload = new
-            {
-                sessionId = DebugSessionId,
-                runId,
-                hypothesisId,
-                location,
-                message,
-                data,
-                timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
-            };
-
-            File.AppendAllText(DebugLogPath, JsonSerializer.Serialize(payload) + Environment.NewLine);
-        }
-        catch
-        {
-            // Ignore logging failures in debug mode.
-        }
     }
 
     private static bool InterruptibleSleep(int totalMilliseconds)
