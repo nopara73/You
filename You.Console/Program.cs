@@ -9,6 +9,7 @@ internal static class Program
 {
     private const int BrowserWindowWidth = 1200;
     private const int BrowserWindowHeight = 800;
+    private const bool EnableInputAutomation = false;
     private const int BrowserWindowResizeRetries = 30;
     private const int BrowserWindowResizeRetryDelayMilliseconds = 200;
     private const uint SetWindowPosNoZOrder = 0x0004;
@@ -103,7 +104,10 @@ internal static class Program
                 continue;
             }
 
-            MoveToAddressBarAndNavigate();
+            if (EnableInputAutomation)
+            {
+                MoveToAddressBarAndNavigate();
+            }
             InterruptibleSleep(AutomationLoopDelayMilliseconds);
         }
 
