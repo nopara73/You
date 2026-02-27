@@ -1,0 +1,19 @@
+# Build artifacts
+**/bin/
+**/obj/
+
+# User-specific files
+*.user
+*.suo
+
+# IDE folders
+.vs/
+
+# Test and coverage outputs
+TestResults/
+coverage/
+*.coverage
+*.coveragexml
+
+# NuGet packages folder (if used locally)
+packages/
