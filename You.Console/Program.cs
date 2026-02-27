@@ -1,9 +1,18 @@
 using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
 using System.Diagnostics;
+using Microsoft.Win32;
 using You.Library;
 
 internal static class Program
 {
+    private const int BrowserWindowWidth = 1200;
+    private const int BrowserWindowHeight = 800;
+    private const int BrowserWindowResizeRetries = 30;
+    private const int BrowserWindowResizeRetryDelayMilliseconds = 200;
+    private const uint SetWindowPosNoZOrder = 0x0004;
+    private const uint SetWindowPosNoActivate = 0x0010;
+    private const uint SpiGetWorkArea = 0x0030;
     private const int ChromeLaunchDelayMilliseconds = 2500;
     private const int MouseClickDelayMilliseconds = 900;
     private const int PostClickKeyboardDelayMilliseconds = 120;
@@ -11,7 +20,7 @@ internal static class Program
     private const int MaxKeyDownMilliseconds = 90;
     private const int MinInterKeyDelayMilliseconds = 60;
     private const int MaxInterKeyDelayMilliseconds = 190;
-    private const string TargetUrl = "twitter.com";
+    private const string TargetUrl = "https://twitter.com";
     private const int ClipboardReadRetries = 4;
     private const int ClipboardReadRetryDelayMilliseconds = 80;
     private const int CursorMoveSteps = 150;
@@ -40,30 +49,249 @@ internal static class Program
             return;
         }
 
-        OpenChromeWindow();
-        Thread.Sleep(ChromeLaunchDelayMilliseconds);
-        MoveToAddressBarAndNavigate();
+        OpenDefaultBrowser(TargetUrl);
     }
 
-    private static void OpenChromeWindow()
+    [SupportedOSPlatform("windows")]
+    private static void OpenDefaultBrowser(string url)
     {
         try
         {
+            if (TryOpenDefaultBrowserInNewWindow(url))
+            {
+                Console.WriteLine($"Opened {url} in a new browser window.");
+                return;
+            }
+
             var startInfo = new ProcessStartInfo
             {
-                FileName = "cmd.exe",
-                Arguments = "/c start \"\" chrome --new-window about:blank",
-                UseShellExecute = true,
-                CreateNoWindow = true
+                FileName = url,
+                UseShellExecute = true
             };
 
             Process.Start(startInfo);
-            Console.WriteLine("Opened a new Chrome window.");
+            Console.WriteLine($"Opened {url} in the default browser.");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Could not open Chrome window: {ex.Message}");
+            try
+            {
+                var fallbackStartInfo = new ProcessStartInfo
+                {
+                    FileName = "cmd.exe",
+                    Arguments = $"/c start \"\" \"{url}\"",
+                    UseShellExecute = true,
+                    CreateNoWindow = true
+                };
+
+                Process.Start(fallbackStartInfo);
+                Console.WriteLine($"Opened {url} in the default browser (fallback path).");
+            }
+            catch (Exception fallbackEx)
+            {
+                Console.WriteLine(
+                    $"Could not open {url} in the default browser: {ex.Message}. " +
+                    $"Fallback also failed: {fallbackEx.Message}");
+            }
         }
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static bool TryOpenDefaultBrowserInNewWindow(string url)
+    {
+        var launchStartUtc = DateTime.UtcNow;
+        var browserCommand = GetDefaultBrowserCommand();
+        if (string.IsNullOrWhiteSpace(browserCommand) || !TryExtractExecutablePath(browserCommand, out var executablePath))
+        {
+            return false;
+        }
+
+        var executableName = Path.GetFileName(executablePath).ToLowerInvariant();
+        var arguments = executableName switch
+        {
+            "firefox.exe" => $"-new-window \"{url}\" --width {BrowserWindowWidth} --height {BrowserWindowHeight}",
+            "chrome.exe" or "msedge.exe" or "brave.exe" or "vivaldi.exe" or "opera.exe" or "launcher.exe"
+                => $"--new-window --window-size={BrowserWindowWidth},{BrowserWindowHeight} \"{url}\"",
+            _ => $"\"{url}\""
+        };
+
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = executablePath,
+            Arguments = arguments,
+            UseShellExecute = false
+        };
+
+        var launchedProcess = Process.Start(startInfo);
+        TryForceResizeBrowserWindow(launchedProcess, executablePath, launchStartUtc);
+        return true;
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static void TryForceResizeBrowserWindow(Process? launchedProcess, string executablePath, DateTime launchStartUtc)
+    {
+        var browserProcessName = Path.GetFileNameWithoutExtension(executablePath);
+        if (string.IsNullOrWhiteSpace(browserProcessName))
+        {
+            return;
+        }
+
+        for (var attempt = 0; attempt < BrowserWindowResizeRetries; attempt++)
+        {
+            var windowHandle = GetCandidateBrowserWindow(launchedProcess, browserProcessName, launchStartUtc);
+            if (windowHandle != IntPtr.Zero && GetWindowRect(windowHandle, out var windowRect))
+            {
+                var targetX = windowRect.Left;
+                var targetY = windowRect.Top;
+                if (TryGetPrimaryWorkArea(out var workArea))
+                {
+                    targetX = Math.Max(workArea.Left, workArea.Right - BrowserWindowWidth);
+                    targetY = workArea.Top;
+                }
+
+                var flags = SetWindowPosNoZOrder | SetWindowPosNoActivate;
+                if (SetWindowPos(
+                    windowHandle,
+                    IntPtr.Zero,
+                    targetX,
+                    targetY,
+                    BrowserWindowWidth,
+                    BrowserWindowHeight,
+                    flags))
+                {
+                    return;
+                }
+            }
+
+            Thread.Sleep(BrowserWindowResizeRetryDelayMilliseconds);
+        }
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static IntPtr GetCandidateBrowserWindow(Process? launchedProcess, string browserProcessName, DateTime launchStartUtc)
+    {
+        if (launchedProcess is not null)
+        {
+            try
+            {
+                launchedProcess.Refresh();
+                if (!launchedProcess.HasExited && launchedProcess.MainWindowHandle != IntPtr.Zero)
+                {
+                    return launchedProcess.MainWindowHandle;
+                }
+            }
+            catch
+            {
+                // Ignore process inspection failures and keep searching.
+            }
+        }
+
+        var foregroundWindow = GetForegroundWindow();
+        if (foregroundWindow != IntPtr.Zero && GetWindowThreadProcessId(foregroundWindow, out var foregroundPid) != 0)
+        {
+            try
+            {
+                using var foregroundProcess = Process.GetProcessById((int)foregroundPid);
+                if (string.Equals(foregroundProcess.ProcessName, browserProcessName, StringComparison.OrdinalIgnoreCase))
+                {
+                    return foregroundWindow;
+                }
+            }
+            catch
+            {
+                // Ignore and try scanning running processes.
+            }
+        }
+
+        Process? newestBrowserProcess = null;
+        try
+        {
+            foreach (var browserProcess in Process.GetProcessesByName(browserProcessName))
+            {
+                try
+                {
+                    if (browserProcess.MainWindowHandle == IntPtr.Zero)
+                    {
+                        continue;
+                    }
+
+                    // Prefer windows created around this launch to avoid resizing old windows.
+                    if (browserProcess.StartTime.ToUniversalTime() < launchStartUtc.AddSeconds(-10))
+                    {
+                        continue;
+                    }
+
+                    if (newestBrowserProcess is null || browserProcess.StartTime > newestBrowserProcess.StartTime)
+                    {
+                        newestBrowserProcess = browserProcess;
+                    }
+                }
+                catch
+                {
+                    browserProcess.Dispose();
+                }
+            }
+
+            return newestBrowserProcess?.MainWindowHandle ?? IntPtr.Zero;
+        }
+        finally
+        {
+            newestBrowserProcess?.Dispose();
+        }
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static bool TryGetPrimaryWorkArea(out Rect workArea)
+    {
+        workArea = default;
+        return SystemParametersInfo(SpiGetWorkArea, 0, out workArea, 0);
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static string? GetDefaultBrowserCommand()
+    {
+        using var userChoiceKey = Registry.CurrentUser.OpenSubKey(
+            @"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice");
+        var progId = userChoiceKey?.GetValue("ProgId") as string;
+        if (string.IsNullOrWhiteSpace(progId))
+        {
+            return null;
+        }
+
+        using var commandKey = Registry.ClassesRoot.OpenSubKey($@"{progId}\shell\open\command");
+        return commandKey?.GetValue(null) as string;
+    }
+
+    private static bool TryExtractExecutablePath(string command, out string executablePath)
+    {
+        executablePath = string.Empty;
+        var trimmed = command.Trim();
+        if (trimmed.Length == 0)
+        {
+            return false;
+        }
+
+        if (trimmed[0] == '"')
+        {
+            var closingQuote = trimmed.IndexOf('"', 1);
+            if (closingQuote <= 1)
+            {
+                return false;
+            }
+
+            executablePath = trimmed.Substring(1, closingQuote - 1);
+            return File.Exists(executablePath);
+        }
+
+        const string exeToken = ".exe";
+        var exeIndex = trimmed.IndexOf(exeToken, StringComparison.OrdinalIgnoreCase);
+        if (exeIndex < 0)
+        {
+            return false;
+        }
+
+        executablePath = trimmed.Substring(0, exeIndex + exeToken.Length);
+        return File.Exists(executablePath);
     }
 
     private static void MoveToAddressBarAndNavigate()
@@ -282,8 +510,26 @@ internal static class Program
     private static extern IntPtr GetForegroundWindow();
 
     [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+    [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool GetWindowRect(IntPtr hWnd, out Rect rect);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetWindowPos(
+        IntPtr hWnd,
+        IntPtr hWndInsertAfter,
+        int x,
+        int y,
+        int cx,
+        int cy,
+        uint uFlags);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SystemParametersInfo(uint uiAction, uint uiParam, out Rect pvParam, uint fWinIni);
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
